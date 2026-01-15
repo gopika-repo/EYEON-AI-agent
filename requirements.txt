@@ -27,3 +27,9 @@ prometheus-client
 google-generativeai
 anthropic
 openai
+pysqlite3-binary
+langchain
+langchain-google-genai
+langchain-community
+chromadb
+pypdf
