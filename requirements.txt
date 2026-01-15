@@ -34,3 +34,6 @@ langchain-community
 chromadb
 pypdf
 langchain-classic
+boto3
+streamlit-mic-recorder
+pii-redactor
