@@ -11,7 +11,7 @@ langchain-community==0.0.38
 # --- COMPUTER VISION & LAYOUT ANALYSIS ---
 ultralytics==8.1.0         # YOLOv11 for high-speed element detection
 transformers==4.37.0       # LayoutLMv3 and DETR for structural understanding
-opencv-python==4.8.1.78    # Pre-processing (Denoising, Grayscale)
+opencv-python-headless==4.8.1.78    # Pre-processing (Denoising, Grayscale)
 paddleocr==2.7.0.3         # High-precision structural OCR
 easyocr==1.7.1             # Secondary OCR for voting
 pytesseract==0.3.10        # Legacy OCR for triple-fusion validation
