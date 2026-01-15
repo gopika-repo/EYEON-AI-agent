@@ -1,11 +1,18 @@
 from pdf2image import convert_from_path
+import platform
 
 def pdf_to_images(pdf_path, dpi=300, poppler_path=None):
     """
     Converts PDF pages to a list of PIL images.
-    Updated for 2026 Windows stability with explicit Poppler pathing.
+    Auto-detects Cloud vs Windows environment.
     """
-    # By adding poppler_path here, we bridge the gap between Python and Windows
+    
+    # TRICK: If we are on Linux (Streamlit Cloud), IGNORE the Windows path!
+    if platform.system() == "Linux":
+        poppler_path = None  
+    
+    # If we are on Windows, keep using the path you passed in.
+    
     return convert_from_path(
         pdf_path, 
         dpi=dpi, 
