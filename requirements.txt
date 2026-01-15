@@ -1,45 +1,9 @@
-# --- SYSTEM & GPU FOUNDATION ---
-# For GPU support (CUDA 12.1), run this manually first:
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# --- CORE AGENTIC FRAMEWORKS ---
-langgraph==0.0.28          # The "Brain" - state management for loops
-crewai==0.28.8             # Task delegation for multi-agent strike teams
-langchain==0.1.0           # Base orchestration
-langchain-community==0.0.38
-
-# --- COMPUTER VISION & LAYOUT ANALYSIS ---
-ultralytics==8.1.0         # YOLOv11 for high-speed element detection
-transformers==4.37.0       # LayoutLMv3 and DETR for structural understanding
-opencv-python-headless==4.8.1.78    # Pre-processing (Denoising, Grayscale)
-paddleocr==2.7.0.3         # High-precision structural OCR
-easyocr==1.7.1             # Secondary OCR for voting
-pytesseract==0.3.10        # Legacy OCR for triple-fusion validation
-
-# --- MULTI-MODAL LLM CONNECTORS ---
-openai==1.12.0             # GPT-4o / GPT-5 access
-anthropic==0.20.1          # Claude 3.5 Sonnet / Opus
-google-generativeai==0.3.2 # Gemini 1.5 Pro (Massive context)
-
-# --- SPATIAL RAG & VECTOR SEARCH ---
-qdrant-client==1.7.3       # Multi-modal vector database
-sentence-transformers==2.5.1 # CLIP embeddings for visual search
-pypdf==4.0.1               # PDF manipulation
-pdfplumber==0.10.4         # Metadata & text coordinate extraction
-pdf2image==1.17.0          # PDF to Tensor conversion
-
-# --- PRODUCTION & DASHBOARD ---
-fastapi==0.109.0           # High-performance API
-uvicorn[standard]==0.24.0  # Production server
-streamlit==1.31.0          # The "Visual Evidence" dashboard
-prometheus-client==0.19.0  # Real-time monitoring metrics
-python-dotenv==1.0.1       # Environment security
-
 streamlit
-langgraph
 langchain
-langchain_groq
-langchain_community
+langchain-community
+langchain-groq
+langgraph
+crewai
 python-dotenv
 pandas
 pillow
@@ -50,3 +14,16 @@ boto3
 streamlit-mic-recorder
 groq
 ultralytics
+transformers
+paddleocr
+easyocr
+pypdf
+pdfplumber
+qdrant-client
+sentence-transformers
+fastapi
+uvicorn
+prometheus-client
+google-generativeai
+anthropic
+openai
