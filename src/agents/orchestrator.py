@@ -1,269 +1,390 @@
 import os
 import json
-from typing import TypedDict, List, Any
-from langgraph.graph import StateGraph, END
+from typing import Dict, Any
+import time
 from PIL import Image
-from pdf2image import convert_from_path
-from dotenv import load_dotenv
 import pytesseract
-from groq import Groq
-
-# --- 1. INITIALIZE ENGINES ---
-try:
-    from src.agents.rag_engine import RAGEngine
-    rag_engine = RAGEngine()
-except ImportError: rag_engine = None
-
-try:
-    from src.agents.validator import ValidatorEngine
-    validator = ValidatorEngine()
-except ImportError: validator = None
-
-try:
-    from src.agents.layout_engine import LayoutEngine
-    layout_engine = LayoutEngine()
-except ImportError: layout_engine = None
-
-try:
-    from src.agents.redactor import RedactorEngine
-    redactor = RedactorEngine()
-except ImportError: redactor = None
-
-load_dotenv()
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+from groq import Groq
+from dotenv import load_dotenv
+import PyPDF2
 
-# --- 2. SCHEMAS ---
-SENSITIVE_KEYS = ["Phone", "Mobile", "Contact", "Email", "E-mail", "ID", "ID Number", "SSN", "DOB", "Date of Birth", "Total", "Total Amount"]
+# Load environment variables
+load_dotenv()
 
-SCHEMA_REGISTRY = {
-    "Resume": {
-        "fields": ["Full Name", "Email", "Phone", "Technical Skills", "Education", "Latest Job Role"],
-        "rag_query": "Who is the candidate? Contact details?"
-    },
-    "Invoice": {
-        "fields": ["Vendor Name", "Invoice Number", "Date", "Total Amount"],
-        "rag_query": "Vendor and total?"
-    },
-    "ID Card": {
-        "fields": ["Full Name", "ID Number", "Date of Birth", "Expiration Date"],
-        "rag_query": "ID details?"
-    },
-    "General": { "fields": ["Main Topic", "Summary"], "rag_query": "Summary?" }
-}
-
-# --- STATE ---
-class AgentState(TypedDict):
-    file_path: str
-    poppler_path: str
-    pages: List[Any]
-    layout_image: Any      
-    layout_data: dict      
-    raw_text: str          
-    translated_text: str    # NEW: Stores the English version
-    detected_language: str  # NEW: Stores origin language
-    doc_category: str
-    entities: dict
-    validation_report: dict
-    redacted_image: Any     
-    summary: str
-    metadata: dict
-
-def get_groq_client():
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key: raise ValueError("❌ GROQ_API_KEY missing!")
-    return Groq(api_key=api_key)
-
-# --- HELPER: TRANSLATION ---
-def translate_to_english(text):
-    """
-    Uses LLM to detect language and translate to English if needed.
-    """
-    if not text or len(text) < 10: return "English", text
-    
-    client = get_groq_client()
-    # Efficient prompt to detect and translate in one go
-    prompt = f"""
-    Task: Translate the following text to English.
-    
-    Rules:
-    1. If it is already in English, return it exactly as is.
-    2. If it is in another language, translate it to English.
-    3. Output format: First line: [Language Name], Second line onwards: [Translated Text]
-    
-    Text:
-    {text[:3000]} 
-    """
-    # We truncate to 3000 chars for speed in this demo
-    
-    try:
-        resp = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant"
-        )
-        content = resp.choices[0].message.content.strip()
+class Orchestrator:
+    def __init__(self):
+        """Initialize orchestrator with error handling"""
+        self.client = None
+        self.vision_agent = None
+        self.rag_engine = None
         
-        # Parse output
-        lines = content.split('\n', 1)
-        lang = lines[0].strip().replace("[", "").replace("]", "")
-        translated = lines[1].strip() if len(lines) > 1 else text
+        # Initialize components with fallbacks
+        try:
+            from src.agents.rag_engine import RAGEngine
+            self.rag_engine = RAGEngine()
+            print("✅ RAG Engine initialized")
+        except Exception as e:
+            print(f"⚠️ RAG Engine not available: {e}")
         
-        return lang, translated
-    except:
-        return "Unknown", text
-
-# --- NODE 1: PERCEPTION (Updated with Translation) ---
-def load_and_ocr_node(state: AgentState):
-    print("\n--- 👁️ NODE: Perception ---")
-    file_path = state['file_path']
-    file_type = state['metadata'].get('file_type', 'pdf')
-    
-    extracted_text = ""
-    pages = []
-    layout_img = None
-    layout_info = {}
-    ocr_scores = []
-    cropped_images = [] 
-    crop_metadata = []
-
-    try:
-        if file_type == 'image':
-            img = Image.open(file_path).convert('RGB')
-            pages.append(img)
+        try:
+            from src.agents.vision_agent import VisionAgent
+            self.vision_agent = VisionAgent()
+            print("✅ Vision Agent initialized")
+        except Exception as e:
+            print(f"⚠️ Vision Agent not available: {e}")
+        
+        # Initialize Groq client
+        api_key = os.getenv("GROQ_API_KEY")
+        if api_key:
+            self.client = Groq(api_key=api_key)
         else:
-            pages = convert_from_path(file_path, poppler_path=state['poppler_path'])
-        
-        # Layout
-        if layout_engine and pages:
-            layout_info, layout_plot_array = layout_engine.analyze_layout(pages[0])
-            layout_img = Image.fromarray(layout_plot_array[..., ::-1])
-            for block in layout_info.get('text_blocks', []):
-                box = block['box']
-                if box[2] > box[0] and box[3] > box[1]:
-                    crop = pages[0].crop((box[0], box[1], box[2], box[3]))
-                    cropped_images.append(crop)
-                    crop_metadata.append(block['label'])
-
-        # OCR
-        full_text_list = []
-        for i, page in enumerate(pages):
-            text = pytesseract.image_to_string(page)
-            full_text_list.append(text)
-            if validator:
-                ocr_scores.append(validator.calculate_ocr_confidence(page))
-        
-        extracted_text = "\n\n".join(full_text_list)
-        avg_score = sum(ocr_scores)/len(ocr_scores) if ocr_scores else 0
-        
-        # --- NEW: TRANSLATION LAYER ---
-        print("   🌍 Checking Language...")
-        lang, translated_text = translate_to_english(extracted_text)
-        print(f"   🗣️ Detected: {lang}")
-        
-        # Index the TRANSLATED text (So RAG works in English)
-        if rag_engine:
-            if translated_text.strip(): 
-                rag_engine.index_document(translated_text, {"source": file_path, "original_lang": lang})
-            if cropped_images: 
-                rag_engine.index_images(cropped_images, crop_metadata)
+            print("⚠️ GROQ_API_KEY not set")
+    
+    def _extract_text_from_pdf(self, file_path: str) -> str:
+        """Extract text from PDF using PyPDF2 (no poppler required)"""
+        text = ""
+        try:
+            with open(file_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                num_pages = len(reader.pages)
+                
+                for page_num in range(num_pages):
+                    page = reader.pages[page_num]
+                    page_text = page.extract_text() or ""
+                    text += f"--- Page {page_num + 1} ---\n{page_text}\n\n"
+                
+            return text
             
-        return {
-            "raw_text": extracted_text,
-            "translated_text": translated_text, # Passed to other agents
-            "detected_language": lang,
-            "pages": pages,
-            "layout_image": layout_img, 
-            "layout_data": layout_info,
-            "metadata": {**state['metadata'], "ocr_score": avg_score}
+        except Exception as e:
+            print(f"PDF extraction error: {e}")
+            return ""
+    
+    def _extract_text_from_image(self, file_path: str) -> str:
+        """Extract text from image using Tesseract"""
+        try:
+            img = Image.open(file_path)
+            text = pytesseract.image_to_string(img)
+            return text
+        except Exception as e:
+            print(f"Image OCR error: {e}")
+            return ""
+    
+    def _extract_text(self, file_path: str, file_type: str) -> str:
+        """Extract text from file based on type"""
+        try:
+            if file_type in ['pdf']:
+                return self._extract_text_from_pdf(file_path)
+            elif file_type in ['png', 'jpg', 'jpeg']:
+                return self._extract_text_from_image(file_path)
+            elif file_type in ['txt']:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    return f.read()
+            else:
+                return ""
+        except Exception as e:
+            print(f"Text extraction error: {e}")
+            return ""
+    
+    def _detect_language(self, text: str) -> tuple:
+        """Detect language of text"""
+        if not text or len(text) < 50:
+            return "Unknown", text
+        
+        try:
+            if self.client:
+                prompt = f"""Detect the language of this text. Return only the language name in English.
+                
+                Text: {text[:500]}
+                
+                Language:"""
+                
+                response = self.client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="llama-3.1-8b-instant",
+                    temperature=0,
+                    max_tokens=10
+                )
+                
+                language = response.choices[0].message.content.strip()
+                
+                # Translate if not English
+                if language.lower() not in ['english', 'en']:
+                    translate_prompt = f"Translate this {language} text to English:\n\n{text[:3000]}"
+                    translate_response = self.client.chat.completions.create(
+                        messages=[{"role": "user", "content": translate_prompt}],
+                        model="llama-3.1-8b-instant",
+                        temperature=0.1,
+                        max_tokens=1024
+                    )
+                    translated = translate_response.choices[0].message.content
+                    return language, translated
+                
+                return language, text
+                
+        except Exception as e:
+            print(f"Language detection error: {e}")
+        
+        return "English", text
+    
+    def _classify_document(self, text: str, vision_analysis: Dict = None) -> str:
+        """Classify document type"""
+        categories = ["Invoice", "Resume", "ID Card", "Contract", "Report", "Letter", "General"]
+        
+        if not text:
+            return "General"
+        
+        try:
+            if self.client:
+                context = f"Text: {text[:2000]}"
+                if vision_analysis and vision_analysis.get('description'):
+                    context += f"\nVision Analysis: {vision_analysis['description'][:500]}"
+                
+                prompt = f"""Classify this document into ONE of these categories: {', '.join(categories)}.
+                
+                {context}
+                
+                Return only the category name."""
+                
+                response = self.client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="llama-3.1-8b-instant",
+                    temperature=0.1,
+                    max_tokens=50
+                )
+                
+                category = response.choices[0].message.content.strip()
+                return category if category in categories else "General"
+                
+        except Exception as e:
+            print(f"Classification error: {e}")
+        
+        return "General"
+    
+    def _extract_entities(self, text: str, doc_type: str) -> Dict:
+        """Extract entities based on document type"""
+        templates = {
+            "Invoice": ["Vendor", "Invoice Number", "Date", "Total Amount", "Items", "Due Date"],
+            "Resume": ["Name", "Email", "Phone", "Skills", "Experience", "Education"],
+            "ID Card": ["Name", "ID Number", "Date of Birth", "Expiry Date", "Address"],
+            "Contract": ["Parties", "Effective Date", "Term", "Payment Terms", "Signatures"],
+            "Report": ["Title", "Author", "Date", "Findings", "Recommendations"],
+            "Letter": ["Sender", "Recipient", "Date", "Subject", "Content"],
+            "General": ["Key People", "Organizations", "Dates", "Important Facts"]
         }
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        return {"raw_text": "", "metadata": {"error": str(e)}}
-
-# --- NODE 2: CLASSIFIER (Uses Translated Text) ---
-def classification_agent(state: AgentState):
-    # Use translated text for better understanding
-    text = state.get('translated_text', state['raw_text'])[:2000]
-    
-    if not text.strip(): return {"doc_category": "Unknown"}
-    client = get_groq_client()
-    response = client.chat.completions.create(
-        messages=[{"role": "user", "content": f"Classify ONE: [Resume, Invoice, ID Card, General]. Text: {text}"}],
-        model="llama-3.1-8b-instant",
-    )
-    return {"doc_category": response.choices[0].message.content.strip()}
-
-# --- NODE 3: EXTRACTOR (Uses Translated Text) ---
-def entity_extraction_agent(state: AgentState):
-    category = state.get('doc_category', 'General')
-    schema = SCHEMA_REGISTRY.get(category, SCHEMA_REGISTRY["General"])
-    
-    # RAG Context (Already Indexed in English)
-    context = ""
-    if rag_engine: context = rag_engine.query(schema["rag_query"])
-    else: context = state.get('translated_text', "")[:4000]
-
-    client = get_groq_client()
-    prompt = f"Extract JSON. Context: {context}. Fields: {json.dumps(schema['fields'])}. Return JSON only."
-    
-    response = client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}, {"role": "system", "content": "Return JSON only."}],
-        model="llama-3.1-8b-instant",
-    )
-    
-    entities = {}
-    validation_report = {}
-    redacted_img = None
-
-    try:
-        content = response.choices[0].message.content
-        start = content.find('{')
-        end = content.rfind('}') + 1
-        entities = json.loads(content[start:end])
         
-        # Validate against ORIGINAL text (to ensure OCR match) or Translated? 
-        # Validator matches text on page, so we use raw_text for validation to be safe.
-        if validator:
-            validation_report = validator.validate_extraction(entities, state['raw_text'])
-            
-        if redactor and state['pages']:
-            values_to_hide = []
-            if isinstance(entities, dict):
-                for key, val in entities.items():
-                    if key in SENSITIVE_KEYS and val:
-                        values_to_hide.append(str(val))
-            
-            # Redactor uses Image + Regex, so it works on the original visual doc
-            redacted_img = redactor.redact_sensitive_data(state['pages'][0], values_to_hide)
-
-    except Exception as e:
-        print(f"❌ Extraction Error: {e}")
+        template = templates.get(doc_type, templates["General"])
         
-    return {
-        "entities": entities, 
-        "validation_report": validation_report,
-        "redacted_image": redacted_img 
-    }
+        try:
+            if self.client:
+                prompt = f"""Extract the following information from this document:
+                
+                Document Type: {doc_type}
+                Fields to extract: {', '.join(template)}
+                
+                Document Text: {text[:3000]}
+                
+                Format as JSON with field names as keys. Use null if information not found.
+                Example: {{"Name": "John Doe", "Email": "john@example.com"}}"""
+                
+                response = self.client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="llama-3.1-8b-instant",
+                    temperature=0.1,
+                    max_tokens=500
+                )
+                
+                content = response.choices[0].message.content
+                
+                # Try to parse JSON
+                try:
+                    start = content.find('{')
+                    end = content.rfind('}') + 1
+                    if start != -1 and end != 0:
+                        return json.loads(content[start:end])
+                except:
+                    pass
+                
+                # Return raw if JSON parsing fails
+                return {"raw_response": content[:500]}
+                
+        except Exception as e:
+            print(f"Entity extraction error: {e}")
+        
+        return {"error": "Extraction failed"}
+    
+    def _generate_summary(self, text: str, entities: Dict = None) -> str:
+        """Generate document summary"""
+        if not text:
+            return "No content available for summary."
+        
+        try:
+            if self.client:
+                context = f"Document Content: {text[:4000]}"
+                if entities:
+                    context += f"\n\nExtracted Entities: {json.dumps(entities, indent=2)}"
+                
+                prompt = f"""Provide a comprehensive 3-4 sentence summary of this document.
+                
+                {context}
+                
+                Focus on:
+                1. Main purpose and content
+                2. Key information and entities
+                3. Important findings or conclusions"""
+                
+                response = self.client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="llama-3.1-8b-instant",
+                    temperature=0.3,
+                    max_tokens=300
+                )
+                
+                return response.choices[0].message.content
+                
+        except Exception as e:
+            print(f"Summary generation error: {e}")
+        
+        return "Summary generation failed."
+    
+    def process_document(self, file_path: str, metadata: Dict = None) -> Dict[str, Any]:
+        """Main processing pipeline"""
+        start_time = time.time()
+        
+        if not metadata:
+            metadata = {}
+        
+        file_type = metadata.get('file_type', 'pdf')
+        
+        print(f"\n🚀 Starting document processing: {file_path}")
+        print(f"📄 File type: {file_type}")
+        
+        # Step 1: Extract text
+        print("1️⃣ Extracting text...")
+        raw_text = self._extract_text(file_path, file_type)
+        
+        if not raw_text or len(raw_text.strip()) < 10:
+            return {
+                "status": "error",
+                "message": "Could not extract meaningful text from document",
+                "processing_time": f"{time.time() - start_time:.2f}s"
+            }
+        
+        print(f"   ✓ Extracted {len(raw_text)} characters")
+        
+        # Step 2: Vision Analysis (if applicable and agent available)
+        vision_analysis = {}
+        if file_type in ['png', 'jpg', 'jpeg'] and self.vision_agent:
+            print("2️⃣ Running vision analysis...")
+            try:
+                vision_analysis = self.vision_agent.analyze_layout(file_path)
+                print(f"   ✓ Vision found: {len(vision_analysis.get('elements_found', []))} elements")
+            except Exception as e:
+                print(f"   ⚠️ Vision analysis failed: {e}")
+                vision_analysis = {"error": str(e)}
+        elif file_type == 'pdf':
+            print("2️⃣ Skipping vision analysis for PDF (requires poppler)")
+            vision_analysis = {"info": "Vision analysis requires poppler installation for PDFs"}
+        else:
+            print("2️⃣ No vision analysis for text files")
+        
+        # Step 3: Language detection and translation
+        print("3️⃣ Detecting language...")
+        language, translated_text = self._detect_language(raw_text)
+        print(f"   ✓ Language: {language}")
+        
+        # Step 4: Document classification
+        print("4️⃣ Classifying document...")
+        doc_category = self._classify_document(translated_text, vision_analysis)
+        print(f"   ✓ Category: {doc_category}")
+        
+        # Step 5: Entity extraction
+        print("5️⃣ Extracting entities...")
+        entities = self._extract_entities(translated_text, doc_category)
+        if isinstance(entities, dict):
+            entity_count = sum(1 for v in entities.values() if v and v != 'null')
+            print(f"   ✓ Extracted {entity_count} entities")
+        
+        # Step 6: Generate summary
+        print("6️⃣ Generating summary...")
+        summary = self._generate_summary(translated_text, entities)
+        print(f"   ✓ Summary generated ({len(summary)} chars)")
+        
+        # Step 7: Compile results
+        processing_time = time.time() - start_time
+        
+        result = {
+            "status": "success",
+            "processing_time": f"{processing_time:.2f}s",
+            "file_info": {
+                "path": file_path,
+                "type": file_type,
+                "name": metadata.get('file_name', 'Unknown')
+            },
+            "content_analysis": {
+                "raw_text_length": len(raw_text),
+                "translated_text_length": len(translated_text),
+                "detected_language": language,
+                "word_count": len(translated_text.split()),
+                "doc_category": doc_category
+            },
+            "vision_analysis": vision_analysis,
+            "entities": entities,
+            "summary": summary,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "metadata": metadata
+        }
+        
+        print(f"\n✅ Processing completed in {processing_time:.2f} seconds")
+        
+        return result
 
-# --- NODE 4: SUMMARIZER ---
-def summarization_agent(state: AgentState):
-    text = state.get('translated_text', "")[:4000]
-    client = get_groq_client()
-    response = client.chat.completions.create(
-        messages=[{"role": "user", "content": f"Summarize in 3 sentences. Text: {text}"}],
-        model="llama-3.1-8b-instant",
-    )
-    return {"summary": response.choices[0].message.content}
+# Global instance for Streamlit compatibility
+_orchestrator = None
 
-# --- GRAPH ---
-workflow = StateGraph(AgentState)
-workflow.add_node("ocr", load_and_ocr_node)
-workflow.add_node("classifier", classification_agent)
-workflow.add_node("extractor", entity_extraction_agent)
-workflow.add_node("summarizer", summarization_agent)
-workflow.set_entry_point("ocr")
-workflow.add_edge("ocr", "classifier")
-workflow.add_edge("classifier", "extractor")
-workflow.add_edge("classifier", "summarizer")
-workflow.add_edge("extractor", END)
-workflow.add_edge("summarizer", END)
-app = workflow.compile()
+def get_orchestrator():
+    """Get or create orchestrator instance"""
+    global _orchestrator
+    if _orchestrator is None:
+        _orchestrator = Orchestrator()
+    return _orchestrator
+
+def process_document(file_path: str, metadata: Dict = None):
+    """Main function for Streamlit app"""
+    orchestrator = get_orchestrator()
+    return orchestrator.process_document(file_path, metadata)
+
+if __name__ == "__main__":
+    # Test the orchestrator
+    test_file = "sample.pdf"
+    if os.path.exists(test_file):
+        result = process_document(test_file, {"file_type": "pdf"})
+        print("\n" + "="*50)
+        print("Processing Results:")
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Test file {test_file} not found")
+        print("Creating a test workflow with minimal data...")
+        
+        # Create a test file
+        test_content = """Invoice
+        
+        Vendor: ABC Corporation
+        Invoice Number: INV-2024-001
+        Date: January 15, 2024
+        Total Amount: $1,250.00
+        
+        Items:
+        1. Software License - $1,000.00
+        2. Support Services - $250.00
+        
+        Due Date: February 15, 2024
+        """
+        
+        with open("test_invoice.txt", "w") as f:
+            f.write(test_content)
+        
+        result = process_document("test_invoice.txt", {"file_type": "txt", "file_name": "test_invoice.txt"})
+        print("\nTest Results:")
+        print(f"Category: {result.get('doc_category')}")
+        print(f"Entities: {result.get('entities')}")

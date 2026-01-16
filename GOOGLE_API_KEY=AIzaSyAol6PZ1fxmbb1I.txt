@@ -1,0 +1,170 @@
+GOOGLE_API_KEY=AIzaSyAol6PZ1fxmbb1I5AbvY78wjKyK6uyqR5s
+import os
+import PyPDF2
+from groq import Groq
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from typing import List, Dict, Any
+
+class SimpleRAGEngine:
+    def __init__(self):
+        # Initialize Groq client
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("❌ GROQ_API_KEY is not set in environment variables")
+        
+        self.client = Groq(api_key=api_key)
+        self.model = "llama-3.1-8b-instant"
+        
+        # Simple text embedding model
+        print("Loading embedding model...")
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        
+    def _extract_text_from_pdf(self, pdf_path: str) -> str:
+        """Extract text from PDF using PyPDF2"""
+        text = ""
+        try:
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                for page in reader.pages:
+                    text += page.extract_text() + "\n"
+        except Exception as e:
+            raise Exception(f"Error reading PDF: {str(e)}")
+        return text
+    
+    def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+        """Simple text chunking"""
+        chunks = []
+        start = 0
+        text_length = len(text)
+        
+        while start < text_length:
+            end = start + chunk_size
+            chunk = text[start:end]
+            chunks.append(chunk)
+            start += chunk_size - overlap
+            
+        return chunks
+    
+    def _get_relevant_chunks(self, query: str, text: str, top_k: int = 5) -> str:
+        """Simple semantic search using embeddings"""
+        # Chunk the text
+        chunks = self._chunk_text(text)
+        
+        # Encode query and chunks
+        query_embedding = self.embedding_model.encode(query)
+        chunk_embeddings = self.embedding_model.encode(chunks)
+        
+        # Calculate similarities
+        similarities = []
+        for chunk_emb in chunk_embeddings:
+            similarity = np.dot(query_embedding, chunk_emb) / (
+                np.linalg.norm(query_embedding) * np.linalg.norm(chunk_emb)
+            )
+            similarities.append(similarity)
+        
+        # Get top-k chunks
+        top_indices = np.argsort(similarities)[-top_k:][::-1]
+        relevant_chunks = [chunks[i] for i in top_indices]
+        
+        return "\n\n".join(relevant_chunks)
+    
+    def _call_groq(self, prompt: str, max_tokens: int = 2048) -> str:
+        """Call Groq API"""
+        try:
+            chat_completion = self.client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=0.1,
+                max_tokens=max_tokens
+            )
+            return chat_completion.choices[0].message.content
+        except Exception as e:
+            return f"API Error: {str(e)}"
+    
+    def get_summary(self, pdf_path: str) -> str:
+        """Generate summary of PDF"""
+        try:
+            text = self._extract_text_from_pdf(pdf_path)
+            if len(text) < 100:
+                return "Document is too short or could not be read."
+            
+            prompt = f"""Please provide a comprehensive summary of this document:
+            
+            {text[:8000]}
+            
+            Focus on:
+            1. Main topic and purpose
+            2. Key points and findings
+            3. Important data or statistics
+            4. Conclusions or recommendations"""
+            
+            return self._call_groq(prompt)
+        except Exception as e:
+            return f"Summary Error: {str(e)}"
+    
+    def get_entities(self, pdf_path: str) -> str:
+        """Extract entities from PDF"""
+        try:
+            text = self._extract_text_from_pdf(pdf_path)
+            if len(text) < 100:
+                return "Document is too short or could not be read."
+            
+            prompt = f"""Extract important entities from this text:
+            
+            {text[:6000]}
+            
+            Please identify and categorize:
+            - People (names, titles)
+            - Organizations (companies, institutions)
+            - Dates and timelines
+            - Locations
+            - Key numbers/amounts
+            
+            Format as a clear, organized list."""
+            
+            return self._call_groq(prompt, max_tokens=1024)
+        except Exception as e:
+            return f"Entity Extraction Error: {str(e)}"
+    
+    def chat(self, query: str, pdf_path: str) -> Dict[str, Any]:
+        """Answer questions about the PDF"""
+        try:
+            # Extract text
+            text = self._extract_text_from_pdf(pdf_path)
+            if len(text) < 100:
+                return {
+                    "answer": "Document is too short or could not be read.",
+                    "sources": []
+                }
+            
+            # Get relevant context
+            context = self._get_relevant_chunks(query, text)
+            
+            # Create prompt
+            prompt = f"""Based on the following document context, answer the question.
+            
+            CONTEXT:
+            {context}
+            
+            QUESTION: {query}
+            
+            ANSWER (based only on the context, say "I don't know" if not in context):"""
+            
+            # Get answer
+            answer = self._call_groq(prompt)
+            
+            # Return results
+            return {
+                "answer": answer,
+                "sources": context[:500] + "..." if len(context) > 500 else context
+            }
+            
+        except Exception as e:
+            return {
+                "answer": f"Error: {str(e)}",
+                "sources": []
+            }
+
+# For backward compatibility with your existing code
+RAGEngine = SimpleRAGEngine
